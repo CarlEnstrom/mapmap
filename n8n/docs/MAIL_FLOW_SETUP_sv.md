@@ -1,4 +1,4 @@
-# Office 365 (Graph/Outlook) – mailärenden till databas
+# Office 365 (Graph/Outlook) – mailärenden + offertentitet till databas
 
 Det här flödet använder **Outlook-noden i n8n** (Microsoft 365/Graph), inte IMAP.
 
@@ -7,48 +7,45 @@ Workflow: `n8n/workflows/mail_followup_dashboard.json`
 ## Hur långt bak kollar den var 10:e minut?
 Kort svar: **max 30 minuter bakåt**.
 
-- Normal lookback: `12` minuter (för att få 2 minuters säkerhetsmarginal vid 10-minuters körning).
-- Konfigurerbar via env: `LOOKBACK_MINUTES` (tillåtet intervall 5–30).
-- Hård spärr i flödet: även vid driftstopp/omstart klampar den lookback till max 30 minuter så att den **inte läser för långt bak**.
+- Normal lookback: `12` minuter.
+- Konfigurerbar via env: `LOOKBACK_MINUTES` (intervall 5–30).
+- Hård spärr i flödet: aldrig mer än 30 minuter bak även efter stopp/omstart.
 
-## Vad flödet gör
-1. Kör var 10:e minut.
-2. Hämtar mail från Office 365 via Outlook-pluginen:
-   - `Sent Items` (utgående)
-   - `Inbox` (inkommande)
-3. Klassar mail till ärendetyper:
-   - `question_out`
-   - `question_in`
-   - `reply_in`
-   - `fortnox_offert` (både ut/in beroende på riktning)
-4. Plockar ut relevant info till databasen:
-   - vad frågan är (`question_text`)
-   - när den skickades/kom in (`sent_at`, `received_at`, `asked_at`)
-   - vem du väntar svar från (`waiting_for_email`)
-   - vilket företag (`customer_company`, `waiting_for_company`)
-   - ordernummer (`order_number`) med regex för 6 siffror som börjar med `819` (`819\d{3}`)
-5. Sparar allt i Postgres med upsert.
-6. Reconcilar status när svar kommer in i samma konversation.
-7. Skickar lunchmail kl 12 med öppna ärenden.
+## Vad som nu är tillagt för offerter
+När en offertkopia (t.ex. Fortnox/offert-mail) hittas skapas den inte bara i `mail_cases` utan även i en separat offertentitet: **`quotes`**.
 
-## Databasmodell (PostgreSQL)
-Tabell: `mail_cases`
+`quotes` lagrar:
+- `quote_number` (offertnummer)
+- `customer_name` / `customer_company`
+- `contact_person`
+- `mail_to` (vem mailet gick till)
+- `quote_amount`
+- `quote_description`
+- `order_number` (matchar `819\d{3}`)
+- tidsfält (`sent_at`, `received_at`)
+- PDF-status (`pdf_expected`, `pdf_parsed`, `pdf_text_excerpt`)
 
-Viktiga kolumner:
-- `external_message_id` (unik)
-- `conversation_id`
-- `direction`, `case_type`, `status`
-- `customer_email`, `customer_company`
-- `waiting_for_email`, `waiting_for_company`
-- `subject`, `question_text`, `question_excerpt`
-- `order_number`
-- `sent_at`, `received_at`, `asked_at`, `answered_at`
-- `source_system`, `created_at`, `updated_at`
+## PDF-innehåll (belopp + beskrivning)
+Nuvarande version markerar om PDF förväntas (`pdf_expected`) och sparar textutdrag från mailtext i `pdf_text_excerpt`.
 
-Se full schemafil: `n8n/docs/mail_cases_schema.sql`.
+För full PDF-tolkning (öppna bilaga och extrahera exakt belopp/beskrivning) behöver du lägga till en bilagekedja i n8n:
+1. Hämta bilagor för offertmail (Outlook attachment endpoint/node).
+2. Filtrera på `.pdf`.
+3. Kör PDF text extraction-node.
+4. Uppdatera `quotes.quote_amount`, `quotes.quote_description`, `quotes.pdf_parsed = true`.
+
+Datamodellen är redan förberedd för detta.
+
+## Övrig information som extraheras
+Både utgående och inkommande klassning plockar ut:
+- `question_text`, `question_excerpt`
+- `sent_at`, `received_at`, `asked_at`
+- väntande part (`waiting_for_email`, `waiting_for_company`)
+- kundfält (`customer_email`, `customer_company`, `customer_contact_person`)
+- `order_number`, `quote_number`, `quote_amount`
 
 ## Credentials i n8n
-- Microsoft Outlook OAuth2 (din färdigkonfigurerade modul)
+- Microsoft Outlook OAuth2
 - Postgres
 
 ## Env-variabler
