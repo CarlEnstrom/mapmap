@@ -1,66 +1,65 @@
 # Office 365 (Graph/Outlook) – mailärenden till databas
 
-Du har helt rätt. Den här versionen använder **Outlook-noden i n8n** (Microsoft 365/Graph), inte IMAP-polling.
+Det här flödet använder **Outlook-noden i n8n** (Microsoft 365/Graph), inte IMAP.
 
 Workflow: `n8n/workflows/mail_followup_dashboard.json`
 
+## Hur långt bak kollar den var 10:e minut?
+Kort svar: **max 30 minuter bakåt**.
+
+- Normal lookback: `12` minuter (för att få 2 minuters säkerhetsmarginal vid 10-minuters körning).
+- Konfigurerbar via env: `LOOKBACK_MINUTES` (tillåtet intervall 5–30).
+- Hård spärr i flödet: även vid driftstopp/omstart klampar den lookback till max 30 minuter så att den **inte läser för långt bak**.
+
 ## Vad flödet gör
 1. Kör var 10:e minut.
-2. Hämtar mail från Office 365 via **Outlook-pluginen**:
+2. Hämtar mail från Office 365 via Outlook-pluginen:
    - `Sent Items` (utgående)
    - `Inbox` (inkommande)
 3. Klassar mail till ärendetyper:
-   - `question_out` (frågor du skickat)
-   - `question_in` (frågor kunder ställt till dig)
-   - `reply_in` (svar in från kund)
-   - `fortnox_offert` (offerter/fortnox-relaterat)
-4. Sparar allt i databasen med upsert.
-5. Reconcilar status (t.ex. utgående fråga markeras besvarad när inkommande i samma conversation kommer in).
-6. Skickar lunchmail kl 12 med öppna ärenden.
-
----
+   - `question_out`
+   - `question_in`
+   - `reply_in`
+   - `fortnox_offert` (både ut/in beroende på riktning)
+4. Plockar ut relevant info till databasen:
+   - vad frågan är (`question_text`)
+   - när den skickades/kom in (`sent_at`, `received_at`, `asked_at`)
+   - vem du väntar svar från (`waiting_for_email`)
+   - vilket företag (`customer_company`, `waiting_for_company`)
+   - ordernummer (`order_number`) med regex för 6 siffror som börjar med `819` (`819\d{3}`)
+5. Sparar allt i Postgres med upsert.
+6. Reconcilar status när svar kommer in i samma konversation.
+7. Skickar lunchmail kl 12 med öppna ärenden.
 
 ## Databasmodell (PostgreSQL)
-Skapas automatiskt av workflow, tabell: `mail_cases`
+Tabell: `mail_cases`
 
-Fält:
-- `id` (PK)
+Viktiga kolumner:
 - `external_message_id` (unik)
 - `conversation_id`
-- `direction` (`outgoing` / `incoming`)
-- `case_type` (`question_out`, `question_in`, `reply_in`, `fortnox_offert`)
-- `status` (`waiting_customer`, `waiting_me`, `answered_customer`)
-- `customer_email`
-- `owner_email`
-- `subject`
-- `question_excerpt`
-- `sent_at`
-- `received_at`
-- `answered_at`
-- `source_system` (default `office365_graph`)
-- `created_at`, `updated_at`
+- `direction`, `case_type`, `status`
+- `customer_email`, `customer_company`
+- `waiting_for_email`, `waiting_for_company`
+- `subject`, `question_text`, `question_excerpt`
+- `order_number`
+- `sent_at`, `received_at`, `asked_at`, `answered_at`
+- `source_system`, `created_at`, `updated_at`
 
----
+Se full schemafil: `n8n/docs/mail_cases_schema.sql`.
 
-## Nödvändiga credentials i n8n
-- **Microsoft Outlook OAuth2** (din redan färdigkonfigurerade modul)
-- **Postgres**
+## Credentials i n8n
+- Microsoft Outlook OAuth2 (din färdigkonfigurerade modul)
+- Postgres
 
-## Rekommenderade env-variabler
+## Env-variabler
 - `OUTLOOK_INBOX_FOLDER_ID` (default: `inbox`)
 - `OUTLOOK_SENT_FOLDER_ID` (default: `sentitems`)
-- `OWNER_EMAIL` (adress för lunchrapport)
-
----
+- `OWNER_EMAIL`
+- `LOOKBACK_MINUTES` (default 12, max 30)
 
 ## Import
 1. Workflows → Import from file
 2. Välj `n8n/workflows/mail_followup_dashboard.json`
 3. Koppla Outlook + Postgres credentials
-4. Kör manuellt en testkörning
+4. Kör manuell testkörning
 5. Aktivera workflow
-
----
-
-## Viktig notering
-Om du vill ha 100% exakt klassning per kund/ärende rekommenderas att lägga till en separat regelmotor (ex. tabell med kunddomäner, ämnesprefix, “mitt svar saknas i tråden”-logik). Den här versionen ger en robust bas med tydlig datamodell för dashboard.
