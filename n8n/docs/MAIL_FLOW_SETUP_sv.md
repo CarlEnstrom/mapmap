@@ -44,6 +44,16 @@ Både utgående och inkommande klassning plockar ut:
 - kundfält (`customer_email`, `customer_company`, `customer_contact_person`)
 - `order_number`, `quote_number`, `quote_amount`
 
+
+## Förfilter innan AI/analys
+Flödet filtrerar nu **innan eventuell AI-analys** så att bara relevanta mail går vidare:
+
+- Utgående: mottagare måste matcha `TARGET_DOMAINS` eller `TARGET_EMAILS` (om satta).
+- Inkommande: avsändare måste matcha `TARGET_DOMAINS` eller `TARGET_EMAILS` (om satta).
+- Endast frågor, offerter eller sannolika svar/trådar (`Re:/Sv:` / `conversationId`) markeras som AI-kandidater (`ai_candidate=true`).
+
+Detta minskar token-spill och fokuserar på mail där det faktiskt kan finnas svar på dina frågor.
+
 ## Credentials i n8n
 - Microsoft Outlook OAuth2
 - Postgres
@@ -53,6 +63,8 @@ Både utgående och inkommande klassning plockar ut:
 - `OUTLOOK_SENT_FOLDER_ID` (default: `sentitems`)
 - `OWNER_EMAIL`
 - `LOOKBACK_MINUTES` (default 12, max 30)
+- `TARGET_DOMAINS` (kommaseparerat, t.ex. `kund.se,partner.com`)
+- `TARGET_EMAILS` (kommaseparerat, t.ex. `anna@kund.se,info@partner.com`)
 
 ## Import
 1. Workflows → Import from file
