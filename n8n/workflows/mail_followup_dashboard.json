@@ -1,0 +1,342 @@
+{
+  "name": "Mailkorgsbevakning – frågor, svar och lunchrapport",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "cron_sync",
+      "name": "Cron var 10:e minut",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mailbox": "={{$env.IMAP_SENT_FOLDER || 'Sent Items'}}",
+        "format": "resolved",
+        "options": {
+          "downloadAttachments": false,
+          "forceReconnect": true,
+          "allowUnauthorizedCerts": false,
+          "searchCriteria": [
+            "UNSEEN"
+          ]
+        }
+      },
+      "id": "imap_sent",
+      "name": "Läs utgående mail (Sent Items)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 1,
+      "position": [
+        520,
+        180
+      ],
+      "credentials": {
+        "imap": {
+          "id": "__SET_IMAP_CREDENTIAL__",
+          "name": "IMAP konto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "format": "resolved",
+        "options": {
+          "downloadAttachments": false,
+          "forceReconnect": true,
+          "allowUnauthorizedCerts": false,
+          "searchCriteria": [
+            "UNSEEN"
+          ]
+        }
+      },
+      "id": "imap_inbox",
+      "name": "Läs inkommande mail (INBOX / Office 365)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 1,
+      "position": [
+        520,
+        420
+      ],
+      "credentials": {
+        "imap": {
+          "id": "__SET_IMAP_CREDENTIAL__",
+          "name": "IMAP konto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = (m.textPlain || m.textHtml || '').toString();\n  const to = (m.to || '').toString();\n  const from = (m.from || '').toString();\n\n  // Exkludera sannolikt spam/systemmail\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|automatiskt svar)/i.test(from + ' ' + subject);\n  if (isAuto) continue;\n\n  const hasQuestion = /[?]|kan du|kan ni|behöver|vill du|vill ni|återkoppla|återkom/i.test(subject + ' ' + body);\n  if (!hasQuestion) continue;\n\n  const isFortnoxOffer = /(fortnox|offert|quote)/i.test(subject + ' ' + body);\n\n  out.push({\n    json: {\n      source: 'sent',\n      messageId: m.messageId || m.id || '',\n      threadKey: ((subject || '').replace(/^\\s*(re|sv|fw|fwd):\\s*/ig, '').trim().toLowerCase()) + '|' + to.toLowerCase(),\n      subject,\n      contact: to,\n      from,\n      date: m.date || new Date().toISOString(),\n      category: isFortnoxOffer ? 'fortnox_offert' : 'utgaende_fraga',\n      questionSnippet: (body || '').replace(/\\s+/g, ' ').slice(0, 280),\n      waitingFor: 'kund'\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "code_sent_extract",
+      "name": "Extrahera frågor i utgående mail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = (m.textPlain || m.textHtml || '').toString();\n  const from = (m.from || '').toString();\n\n  // Filter: fokus på riktiga personmail till dig, inte spam/auto\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|automatiskt svar|out of office)/i.test(from + ' ' + subject);\n  if (isAuto) continue;\n\n  const hasQuestion = /[?]|kan du|kan ni|behöver|vill du|vill ni|återkoppla|när kan/i.test(subject + ' ' + body);\n\n  out.push({\n    json: {\n      source: 'inbox',\n      messageId: m.messageId || m.id || '',\n      inReplyTo: m.inReplyTo || '',\n      threadKey: ((subject || '').replace(/^\\s*(re|sv|fw|fwd):\\s*/ig, '').trim().toLowerCase()),\n      subject,\n      contact: from,\n      date: m.date || new Date().toISOString(),\n      hasQuestion,\n      questionSnippet: (body || '').replace(/\\s+/g, ' ').slice(0, 280)\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "code_inbox_extract",
+      "name": "Extrahera svar + frågor från kunder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "merge_streams",
+      "name": "Slå ihop mailströmmar",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.1,
+      "position": [
+        1030,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = getWorkflowStaticData('global');\nstate.pendingFromCustomer = state.pendingFromCustomer || {};\nstate.pendingFromMe = state.pendingFromMe || {};\nstate.answered = state.answered || {};\nstate.lastLunchSummaryDate = state.lastLunchSummaryDate || '';\n\nfor (const item of items) {\n  const m = item.json;\n\n  if (m.source === 'sent') {\n    state.pendingFromCustomer[m.threadKey] = {\n      contact: m.contact,\n      subject: m.subject,\n      category: m.category,\n      askedAt: m.date,\n      questionSnippet: m.questionSnippet,\n      status: 'vantar_pa_svar'\n    };\n    continue;\n  }\n\n  if (m.source === 'inbox') {\n    // Inkommande svar som matchar tidigare utgående fråga\n    const matchKey = Object.keys(state.pendingFromCustomer).find(k => k.startsWith(m.threadKey + '|') || k.includes(m.threadKey));\n    if (matchKey) {\n      state.pendingFromCustomer[matchKey].status = 'besvarad';\n      state.pendingFromCustomer[matchKey].answeredAt = m.date;\n      state.answered[matchKey] = state.pendingFromCustomer[matchKey];\n      delete state.pendingFromCustomer[matchKey];\n      continue;\n    }\n\n    // Fråga från kund som väntar på svar från dig\n    if (m.hasQuestion) {\n      const key = `${m.threadKey}|${m.contact.toLowerCase()}`;\n      state.pendingFromMe[key] = {\n        contact: m.contact,\n        subject: m.subject,\n        askedAt: m.date,\n        questionSnippet: m.questionSnippet,\n        status: 'kund_vantar_pa_mig'\n      };\n    }\n  }\n}\n\nconst pendingCustomer = Object.entries(state.pendingFromCustomer).map(([key, v]) => ({ key, ...v }));\nconst pendingMe = Object.entries(state.pendingFromMe).map(([key, v]) => ({ key, ...v }));\n\nconst todoLines = [];\ntodoLines.push(`# Mail-uppföljning ${new Date().toISOString()}`);\ntodoLines.push('');\ntodoLines.push('## Jag väntar på svar från kund');\nfor (const p of pendingCustomer) {\n  const tag = p.category === 'fortnox_offert' ? '[FORTNOX/OFFERT]' : '[UTGÅENDE FRÅGA]';\n  todoLines.push(`- ${tag} ${p.contact} | ${p.subject} | fråga: ${p.questionSnippet}`);\n}\nif (!pendingCustomer.length) todoLines.push('- Inga öppna kundsvar.');\n\ntodoLines.push('');\ntodoLines.push('## Kunder väntar på svar från mig');\nfor (const p of pendingMe) {\n  todoLines.push(`- ${p.contact} | ${p.subject} | väntar på: ${p.questionSnippet}`);\n}\nif (!pendingMe.length) todoLines.push('- Inga öppna frågor till mig.');\n\nconst dashboard = {\n  generatedAt: new Date().toISOString(),\n  pendingFromCustomer: pendingCustomer,\n  pendingFromMe: pendingMe\n};\n\nconst now = new Date();\nconst today = now.toISOString().slice(0, 10);\nconst isLunchWindow = now.getHours() === 12;\nconst shouldSendLunchSummary = isLunchWindow && state.lastLunchSummaryDate !== today;\nif (shouldSendLunchSummary) state.lastLunchSummaryDate = today;\n\nconst mailSummary = [\n  `Lunchrapport ${today}`,\n  '',\n  'Jag väntar på svar från kund:',\n  ...pendingCustomer.map(p => `- ${p.contact}: ${p.subject}`),\n  '',\n  'Kunder väntar på svar från mig:',\n  ...pendingMe.map(p => `- ${p.contact}: ${p.subject} (väntar på: ${p.questionSnippet})`)\n].join('\\n');\n\nreturn [{\n  json: {\n    shouldSendLunchSummary,\n    todoText: todoLines.join('\\n'),\n    dashboardJson: JSON.stringify(dashboard, null, 2),\n    mailSummary\n  }\n}];"
+      },
+      "id": "code_state",
+      "name": "Bygg tillstånd + textlista + dashboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.shouldSendLunchSummary}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if_lunch",
+      "name": "Är det lunchrapport nu?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.OWNER_EMAIL}}",
+        "subject": "Lunchrapport: uppföljning av kundmail",
+        "text": "={{$json.mailSummary}}",
+        "options": {}
+      },
+      "id": "send_email",
+      "name": "Skicka lunchmail till mig själv",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1770,
+        220
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "__SET_SMTP_CREDENTIAL__",
+          "name": "SMTP konto"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/data/mail-followup/todo.txt",
+        "data": "={{$json.todoText}}",
+        "options": {}
+      },
+      "id": "write_todo",
+      "name": "Skriv textlista (todo.txt)",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1770,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/data/mail-followup/dashboard.json",
+        "data": "={{$json.dashboardJson}}",
+        "options": {}
+      },
+      "id": "write_dashboard",
+      "name": "Skriv dashboarddata (JSON)",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1980,
+        380
+      ]
+    }
+  ],
+  "connections": {
+    "Cron var 10:e minut": {
+      "main": [
+        [
+          {
+            "node": "Läs utgående mail (Sent Items)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Läs inkommande mail (INBOX / Office 365)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrahera frågor i utgående mail": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop mailströmmar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrahera svar + frågor från kunder": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop mailströmmar",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Slå ihop mailströmmar": {
+      "main": [
+        [
+          {
+            "node": "Bygg tillstånd + textlista + dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bygg tillstånd + textlista + dashboard": {
+      "main": [
+        [
+          {
+            "node": "Är det lunchrapport nu?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Är det lunchrapport nu?": {
+      "main": [
+        [
+          {
+            "node": "Skicka lunchmail till mig själv",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skriv textlista (todo.txt)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skicka lunchmail till mig själv": {
+      "main": [
+        [
+          {
+            "node": "Skriv textlista (todo.txt)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skriv textlista (todo.txt)": {
+      "main": [
+        [
+          {
+            "node": "Skriv dashboarddata (JSON)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Läs utgående mail (Sent Items)": {
+      "main": [
+        [
+          {
+            "node": "Extrahera frågor i utgående mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Läs inkommande mail (INBOX / Office 365)": {
+      "main": [
+        [
+          {
+            "node": "Extrahera svar + frågor från kunder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Övervakar utgående frågor och inkommande svar, håller isär Fortnox-offerter, skriver textlista + dashboard-JSON och skickar daglig lunchrapport."
+  },
+  "id": "mail_followup_dashboard"
+}
