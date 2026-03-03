@@ -1,7 +1,14 @@
 {
-  "name": "Mailkorgsbevakning – frågor, svar och lunchrapport",
+  "name": "Office365 mailärenden -> DB + lunchrapport",
   "nodes": [
     {
+      "id": "schedule",
+      "name": "Schema var 10:e minut",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        220,
+        260
+      ],
       "parameters": {
         "rule": {
           "interval": [
@@ -12,316 +19,418 @@
           ]
         }
       },
-      "id": "cron_sync",
-      "name": "Cron var 10:e minut",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [
-        260,
-        300
-      ]
+      "typeVersion": 1.2
     },
     {
-      "parameters": {
-        "mailbox": "={{$env.IMAP_SENT_FOLDER || 'Sent Items'}}",
-        "format": "resolved",
-        "options": {
-          "downloadAttachments": false,
-          "forceReconnect": true,
-          "allowUnauthorizedCerts": false,
-          "searchCriteria": [
-            "UNSEEN"
-          ]
-        }
-      },
-      "id": "imap_sent",
-      "name": "Läs utgående mail (Sent Items)",
-      "type": "n8n-nodes-base.emailReadImap",
-      "typeVersion": 1,
+      "id": "window",
+      "name": "Bygg tidsfönster",
+      "type": "n8n-nodes-base.code",
       "position": [
-        520,
-        180
+        430,
+        260
       ],
+      "parameters": {
+        "jsCode": "const state = getWorkflowStaticData('global');\nconst now = new Date();\nconst defaultLookbackMinutes = 20;\nconst since = state.lastPollAt ? new Date(state.lastPollAt) : new Date(now.getTime() - defaultLookbackMinutes * 60 * 1000);\nstate.lastPollAt = now.toISOString();\nreturn [{ json: {\n  since: since.toISOString(),\n  inboxFolderId: $env.OUTLOOK_INBOX_FOLDER_ID || 'inbox',\n  sentFolderId: $env.OUTLOOK_SENT_FOLDER_ID || 'sentitems'\n}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "outlook_sent",
+      "name": "Outlook: hämta skickade",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "position": [
+        660,
+        160
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "folderId": "={{$json.sentFolderId}}",
+          "filter": "=lastModifiedDateTime ge {{$json.since}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 2,
       "credentials": {
-        "imap": {
-          "id": "__SET_IMAP_CREDENTIAL__",
-          "name": "IMAP konto"
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
         }
       }
     },
     {
-      "parameters": {
-        "mailbox": "INBOX",
-        "format": "resolved",
-        "options": {
-          "downloadAttachments": false,
-          "forceReconnect": true,
-          "allowUnauthorizedCerts": false,
-          "searchCriteria": [
-            "UNSEEN"
-          ]
-        }
-      },
-      "id": "imap_inbox",
-      "name": "Läs inkommande mail (INBOX / Office 365)",
-      "type": "n8n-nodes-base.emailReadImap",
-      "typeVersion": 1,
+      "id": "outlook_inbox",
+      "name": "Outlook: hämta inbox",
+      "type": "n8n-nodes-base.microsoftOutlook",
       "position": [
-        520,
-        420
+        660,
+        360
       ],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "folderId": "={{$json.inboxFolderId}}",
+          "filter": "=lastModifiedDateTime ge {{$json.since}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 2,
       "credentials": {
-        "imap": {
-          "id": "__SET_IMAP_CREDENTIAL__",
-          "name": "IMAP konto"
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
         }
       }
     },
     {
-      "parameters": {
-        "jsCode": "const out = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = (m.textPlain || m.textHtml || '').toString();\n  const to = (m.to || '').toString();\n  const from = (m.from || '').toString();\n\n  // Exkludera sannolikt spam/systemmail\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|automatiskt svar)/i.test(from + ' ' + subject);\n  if (isAuto) continue;\n\n  const hasQuestion = /[?]|kan du|kan ni|behöver|vill du|vill ni|återkoppla|återkom/i.test(subject + ' ' + body);\n  if (!hasQuestion) continue;\n\n  const isFortnoxOffer = /(fortnox|offert|quote)/i.test(subject + ' ' + body);\n\n  out.push({\n    json: {\n      source: 'sent',\n      messageId: m.messageId || m.id || '',\n      threadKey: ((subject || '').replace(/^\\s*(re|sv|fw|fwd):\\s*/ig, '').trim().toLowerCase()) + '|' + to.toLowerCase(),\n      subject,\n      contact: to,\n      from,\n      date: m.date || new Date().toISOString(),\n      category: isFortnoxOffer ? 'fortnox_offert' : 'utgaende_fraga',\n      questionSnippet: (body || '').replace(/\\s+/g, ' ').slice(0, 280),\n      waitingFor: 'kund'\n    }\n  });\n}\nreturn out;"
-      },
-      "id": "code_sent_extract",
-      "name": "Extrahera frågor i utgående mail",
+      "id": "normalize_sent",
+      "name": "Normalisera skickade frågor",
       "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
       "position": [
-        780,
-        180
-      ]
+        910,
+        160
+      ],
+      "parameters": {
+        "jsCode": "const rows = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = ((m.bodyPreview || '') + ' ' + (m.body?.content || '')).toLowerCase();\n  const to = (m.toRecipients || []).map(r => r?.emailAddress?.address).filter(Boolean).join('; ');\n  const from = m.from?.emailAddress?.address || '';\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|out of office|automatiskt svar)/i.test(subject + ' ' + from);\n  if (isAuto) continue;\n  const hasQuestion = /[?]|kan du|kan ni|återkoppla|behöver|när kan|vill du|vill ni/i.test(subject + ' ' + body);\n  if (!hasQuestion) continue;\n  const isFortnox = /(fortnox|offert|quote)/i.test(subject + ' ' + body);\n  rows.push({json:{\n    external_message_id: m.id || '',\n    conversation_id: m.conversationId || '',\n    direction: 'outgoing',\n    case_type: isFortnox ? 'fortnox_offert' : 'question_out',\n    status: 'waiting_customer',\n    customer_email: to,\n    owner_email: from,\n    subject,\n    question_excerpt: (m.bodyPreview || '').slice(0,600),\n    sent_at: m.sentDateTime || null,\n    received_at: null,\n    answered_at: null,\n    source_system: 'office365_graph'\n  }});\n}\nreturn rows;"
+      },
+      "typeVersion": 2
     },
     {
-      "parameters": {
-        "jsCode": "const out = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = (m.textPlain || m.textHtml || '').toString();\n  const from = (m.from || '').toString();\n\n  // Filter: fokus på riktiga personmail till dig, inte spam/auto\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|automatiskt svar|out of office)/i.test(from + ' ' + subject);\n  if (isAuto) continue;\n\n  const hasQuestion = /[?]|kan du|kan ni|behöver|vill du|vill ni|återkoppla|när kan/i.test(subject + ' ' + body);\n\n  out.push({\n    json: {\n      source: 'inbox',\n      messageId: m.messageId || m.id || '',\n      inReplyTo: m.inReplyTo || '',\n      threadKey: ((subject || '').replace(/^\\s*(re|sv|fw|fwd):\\s*/ig, '').trim().toLowerCase()),\n      subject,\n      contact: from,\n      date: m.date || new Date().toISOString(),\n      hasQuestion,\n      questionSnippet: (body || '').replace(/\\s+/g, ' ').slice(0, 280)\n    }\n  });\n}\nreturn out;"
-      },
-      "id": "code_inbox_extract",
-      "name": "Extrahera svar + frågor från kunder",
+      "id": "normalize_inbox",
+      "name": "Normalisera inkommande",
       "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
       "position": [
-        780,
-        420
-      ]
+        910,
+        360
+      ],
+      "parameters": {
+        "jsCode": "const rows = [];\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const body = ((m.bodyPreview || '') + ' ' + (m.body?.content || '')).toLowerCase();\n  const from = m.from?.emailAddress?.address || '';\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|out of office|automatiskt svar)/i.test(subject + ' ' + from);\n  if (isAuto) continue;\n  const hasQuestion = /[?]|kan du|kan ni|återkoppla|behöver|när kan|vill du|vill ni/i.test(subject + ' ' + body);\n  rows.push({json:{\n    external_message_id: m.id || '',\n    conversation_id: m.conversationId || '',\n    direction: 'incoming',\n    case_type: hasQuestion ? 'question_in' : 'reply_in',\n    status: hasQuestion ? 'waiting_me' : 'answered_customer',\n    customer_email: from,\n    owner_email: '',\n    subject,\n    question_excerpt: (m.bodyPreview || '').slice(0,600),\n    sent_at: null,\n    received_at: m.receivedDateTime || null,\n    answered_at: null,\n    source_system: 'office365_graph'\n  }});\n}\nreturn rows;"
+      },
+      "typeVersion": 2
     },
     {
+      "id": "merge",
+      "name": "Slå ihop ärenden",
+      "type": "n8n-nodes-base.merge",
+      "position": [
+        1140,
+        260
+      ],
       "parameters": {
         "mode": "append"
       },
-      "id": "merge_streams",
-      "name": "Slå ihop mailströmmar",
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 2.1,
-      "position": [
-        1030,
-        300
-      ]
+      "typeVersion": 2.1
     },
     {
+      "id": "db_init",
+      "name": "DB init tabell",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1360,
+        140
+      ],
       "parameters": {
-        "jsCode": "const state = getWorkflowStaticData('global');\nstate.pendingFromCustomer = state.pendingFromCustomer || {};\nstate.pendingFromMe = state.pendingFromMe || {};\nstate.answered = state.answered || {};\nstate.lastLunchSummaryDate = state.lastLunchSummaryDate || '';\n\nfor (const item of items) {\n  const m = item.json;\n\n  if (m.source === 'sent') {\n    state.pendingFromCustomer[m.threadKey] = {\n      contact: m.contact,\n      subject: m.subject,\n      category: m.category,\n      askedAt: m.date,\n      questionSnippet: m.questionSnippet,\n      status: 'vantar_pa_svar'\n    };\n    continue;\n  }\n\n  if (m.source === 'inbox') {\n    // Inkommande svar som matchar tidigare utgående fråga\n    const matchKey = Object.keys(state.pendingFromCustomer).find(k => k.startsWith(m.threadKey + '|') || k.includes(m.threadKey));\n    if (matchKey) {\n      state.pendingFromCustomer[matchKey].status = 'besvarad';\n      state.pendingFromCustomer[matchKey].answeredAt = m.date;\n      state.answered[matchKey] = state.pendingFromCustomer[matchKey];\n      delete state.pendingFromCustomer[matchKey];\n      continue;\n    }\n\n    // Fråga från kund som väntar på svar från dig\n    if (m.hasQuestion) {\n      const key = `${m.threadKey}|${m.contact.toLowerCase()}`;\n      state.pendingFromMe[key] = {\n        contact: m.contact,\n        subject: m.subject,\n        askedAt: m.date,\n        questionSnippet: m.questionSnippet,\n        status: 'kund_vantar_pa_mig'\n      };\n    }\n  }\n}\n\nconst pendingCustomer = Object.entries(state.pendingFromCustomer).map(([key, v]) => ({ key, ...v }));\nconst pendingMe = Object.entries(state.pendingFromMe).map(([key, v]) => ({ key, ...v }));\n\nconst todoLines = [];\ntodoLines.push(`# Mail-uppföljning ${new Date().toISOString()}`);\ntodoLines.push('');\ntodoLines.push('## Jag väntar på svar från kund');\nfor (const p of pendingCustomer) {\n  const tag = p.category === 'fortnox_offert' ? '[FORTNOX/OFFERT]' : '[UTGÅENDE FRÅGA]';\n  todoLines.push(`- ${tag} ${p.contact} | ${p.subject} | fråga: ${p.questionSnippet}`);\n}\nif (!pendingCustomer.length) todoLines.push('- Inga öppna kundsvar.');\n\ntodoLines.push('');\ntodoLines.push('## Kunder väntar på svar från mig');\nfor (const p of pendingMe) {\n  todoLines.push(`- ${p.contact} | ${p.subject} | väntar på: ${p.questionSnippet}`);\n}\nif (!pendingMe.length) todoLines.push('- Inga öppna frågor till mig.');\n\nconst dashboard = {\n  generatedAt: new Date().toISOString(),\n  pendingFromCustomer: pendingCustomer,\n  pendingFromMe: pendingMe\n};\n\nconst now = new Date();\nconst today = now.toISOString().slice(0, 10);\nconst isLunchWindow = now.getHours() === 12;\nconst shouldSendLunchSummary = isLunchWindow && state.lastLunchSummaryDate !== today;\nif (shouldSendLunchSummary) state.lastLunchSummaryDate = today;\n\nconst mailSummary = [\n  `Lunchrapport ${today}`,\n  '',\n  'Jag väntar på svar från kund:',\n  ...pendingCustomer.map(p => `- ${p.contact}: ${p.subject}`),\n  '',\n  'Kunder väntar på svar från mig:',\n  ...pendingMe.map(p => `- ${p.contact}: ${p.subject} (väntar på: ${p.questionSnippet})`)\n].join('\\n');\n\nreturn [{\n  json: {\n    shouldSendLunchSummary,\n    todoText: todoLines.join('\\n'),\n    dashboardJson: JSON.stringify(dashboard, null, 2),\n    mailSummary\n  }\n}];"
+        "operation": "executeQuery",
+        "query": "CREATE TABLE IF NOT EXISTS mail_cases (\n  id BIGSERIAL PRIMARY KEY,\n  external_message_id TEXT NOT NULL,\n  conversation_id TEXT,\n  direction TEXT NOT NULL,\n  case_type TEXT NOT NULL,\n  status TEXT NOT NULL,\n  customer_email TEXT,\n  owner_email TEXT,\n  subject TEXT,\n  question_excerpt TEXT,\n  sent_at TIMESTAMPTZ,\n  received_at TIMESTAMPTZ,\n  answered_at TIMESTAMPTZ,\n  source_system TEXT DEFAULT 'office365_graph',\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  updated_at TIMESTAMPTZ DEFAULT NOW(),\n  UNIQUE (external_message_id)\n);"
       },
-      "id": "code_state",
-      "name": "Bygg tillstånd + textlista + dashboard",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1280,
-        300
-      ]
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
     },
     {
+      "id": "db_upsert",
+      "name": "DB upsert mail_cases",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1360,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO mail_cases (\n  external_message_id, conversation_id, direction, case_type, status,\n  customer_email, owner_email, subject, question_excerpt,\n  sent_at, received_at, answered_at, source_system, updated_at\n) VALUES (\n  {{ $json.external_message_id ? \"'\" + $json.external_message_id.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.conversation_id ? \"'\" + $json.conversation_id.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.direction ? \"'\" + $json.direction + \"'\" : 'NULL' }},\n  {{ $json.case_type ? \"'\" + $json.case_type + \"'\" : 'NULL' }},\n  {{ $json.status ? \"'\" + $json.status + \"'\" : 'NULL' }},\n  {{ $json.customer_email ? \"'\" + $json.customer_email.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.owner_email ? \"'\" + $json.owner_email.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.subject ? \"'\" + $json.subject.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.question_excerpt ? \"'\" + $json.question_excerpt.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.sent_at ? \"'\" + $json.sent_at + \"'\" : 'NULL' }},\n  {{ $json.received_at ? \"'\" + $json.received_at + \"'\" : 'NULL' }},\n  {{ $json.answered_at ? \"'\" + $json.answered_at + \"'\" : 'NULL' }},\n  'office365_graph',\n  NOW()\n)\nON CONFLICT (external_message_id) DO UPDATE SET\n  conversation_id = EXCLUDED.conversation_id,\n  direction = EXCLUDED.direction,\n  case_type = EXCLUDED.case_type,\n  status = EXCLUDED.status,\n  customer_email = EXCLUDED.customer_email,\n  owner_email = EXCLUDED.owner_email,\n  subject = EXCLUDED.subject,\n  question_excerpt = EXCLUDED.question_excerpt,\n  sent_at = COALESCE(EXCLUDED.sent_at, mail_cases.sent_at),\n  received_at = COALESCE(EXCLUDED.received_at, mail_cases.received_at),\n  answered_at = COALESCE(EXCLUDED.answered_at, mail_cases.answered_at),\n  updated_at = NOW();"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "db_reconcile",
+      "name": "DB reconcila svar",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1590,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE mail_cases outq\nSET status='answered_customer', answered_at = NOW(), updated_at = NOW()\nFROM mail_cases inb\nWHERE outq.conversation_id IS NOT NULL\n  AND outq.conversation_id = inb.conversation_id\n  AND outq.direction='outgoing'\n  AND outq.status='waiting_customer'\n  AND inb.direction='incoming';"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "lunch_guard",
+      "name": "Lunchguard",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1810,
+        340
+      ],
+      "parameters": {
+        "jsCode": "const state = getWorkflowStaticData('global');\nstate.lastLunchSummaryDate = state.lastLunchSummaryDate || '';\nconst now = new Date();\nconst today = now.toISOString().slice(0,10);\nconst should = now.getHours() === 12 && state.lastLunchSummaryDate !== today;\nif (should) state.lastLunchSummaryDate = today;\nreturn [{json:{shouldSendLunch: should}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "if_lunch",
+      "name": "Är lunchmail aktivt?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2020,
+        340
+      ],
       "parameters": {
         "conditions": {
           "boolean": [
             {
-              "value1": "={{$json.shouldSendLunchSummary}}",
+              "value1": "={{$json.shouldSendLunch}}",
               "value2": true
             }
           ]
         }
       },
-      "id": "if_lunch",
-      "name": "Är det lunchrapport nu?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        1520,
-        300
-      ]
+      "typeVersion": 2
     },
     {
-      "parameters": {
-        "fromEmail": "={{$env.SMTP_FROM}}",
-        "toEmail": "={{$env.OWNER_EMAIL}}",
-        "subject": "Lunchrapport: uppföljning av kundmail",
-        "text": "={{$json.mailSummary}}",
-        "options": {}
-      },
-      "id": "send_email",
-      "name": "Skicka lunchmail till mig själv",
-      "type": "n8n-nodes-base.emailSend",
-      "typeVersion": 2.1,
+      "id": "db_lunch_select",
+      "name": "DB hämta öppna ärenden",
+      "type": "n8n-nodes-base.postgres",
       "position": [
-        1770,
-        220
+        2240,
+        260
       ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT customer_email, subject, case_type, status,\nCOALESCE(sent_at, received_at) AS event_time\nFROM mail_cases\nWHERE status IN ('waiting_customer','waiting_me')\nORDER BY event_time DESC\nLIMIT 100;"
+      },
+      "typeVersion": 2.4,
       "credentials": {
-        "smtp": {
-          "id": "__SET_SMTP_CREDENTIAL__",
-          "name": "SMTP konto"
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
         }
       }
     },
     {
-      "parameters": {
-        "operation": "write",
-        "fileName": "=/data/mail-followup/todo.txt",
-        "data": "={{$json.todoText}}",
-        "options": {}
-      },
-      "id": "write_todo",
-      "name": "Skriv textlista (todo.txt)",
-      "type": "n8n-nodes-base.readWriteFile",
-      "typeVersion": 1,
+      "id": "format_lunch",
+      "name": "Formatera lunchmail",
+      "type": "n8n-nodes-base.code",
       "position": [
-        1770,
-        380
-      ]
+        2460,
+        260
+      ],
+      "parameters": {
+        "jsCode": "const rows = items.map(i => i.json);\nconst waitingCustomer = rows.filter(r => r.status === 'waiting_customer');\nconst waitingMe = rows.filter(r => r.status === 'waiting_me');\nconst lines = [];\nlines.push(`Lunchrapport ${new Date().toISOString().slice(0,10)}`);\nlines.push('');\nlines.push('Jag väntar på svar från kund:');\nif (!waitingCustomer.length) lines.push('- Inga öppna ärenden.');\nfor (const r of waitingCustomer) lines.push(`- ${r.customer_email || '(okänd)'} | ${r.subject || '(utan ämne)'} | ${r.case_type}`);\nlines.push('');\nlines.push('Kunder väntar på svar från mig:');\nif (!waitingMe.length) lines.push('- Inga öppna ärenden.');\nfor (const r of waitingMe) lines.push(`- ${r.customer_email || '(okänd)'} | ${r.subject || '(utan ämne)'} | ${r.case_type}`);\nreturn [{json:{body: lines.join('\\n')}}];"
+      },
+      "typeVersion": 2
     },
     {
-      "parameters": {
-        "operation": "write",
-        "fileName": "=/data/mail-followup/dashboard.json",
-        "data": "={{$json.dashboardJson}}",
-        "options": {}
-      },
-      "id": "write_dashboard",
-      "name": "Skriv dashboarddata (JSON)",
-      "type": "n8n-nodes-base.readWriteFile",
-      "typeVersion": 1,
+      "id": "send_lunch",
+      "name": "Outlook: skicka lunchmail",
+      "type": "n8n-nodes-base.microsoftOutlook",
       "position": [
-        1980,
-        380
-      ]
+        2680,
+        260
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "subject": "Lunchrapport – mailärenden",
+        "message": "={{$json.body}}",
+        "toRecipients": "={{$env.OWNER_EMAIL}}",
+        "additionalFields": {}
+      },
+      "typeVersion": 2,
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
+        }
+      }
     }
   ],
   "connections": {
-    "Cron var 10:e minut": {
+    "Schema var 10:e minut": {
       "main": [
         [
           {
-            "node": "Läs utgående mail (Sent Items)",
+            "node": "Bygg tidsfönster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bygg tidsfönster": {
+      "main": [
+        [
+          {
+            "node": "Outlook: hämta skickade",
             "type": "main",
             "index": 0
           },
           {
-            "node": "Läs inkommande mail (INBOX / Office 365)",
+            "node": "Outlook: hämta inbox",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Extrahera frågor i utgående mail": {
+    "Outlook: hämta skickade": {
       "main": [
         [
           {
-            "node": "Slå ihop mailströmmar",
+            "node": "Normalisera skickade frågor",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Extrahera svar + frågor från kunder": {
+    "Outlook: hämta inbox": {
       "main": [
         [
           {
-            "node": "Slå ihop mailströmmar",
+            "node": "Normalisera inkommande",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisera skickade frågor": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop ärenden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisera inkommande": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop ärenden",
             "type": "main",
             "index": 1
           }
         ]
       ]
     },
-    "Slå ihop mailströmmar": {
+    "Slå ihop ärenden": {
       "main": [
         [
           {
-            "node": "Bygg tillstånd + textlista + dashboard",
+            "node": "DB init tabell",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Bygg tillstånd + textlista + dashboard": {
+    "DB init tabell": {
       "main": [
         [
           {
-            "node": "Är det lunchrapport nu?",
+            "node": "DB upsert mail_cases",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Är det lunchrapport nu?": {
+    "DB upsert mail_cases": {
       "main": [
         [
           {
-            "node": "Skicka lunchmail till mig själv",
+            "node": "DB reconcila svar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB reconcila svar": {
+      "main": [
+        [
+          {
+            "node": "Lunchguard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lunchguard": {
+      "main": [
+        [
+          {
+            "node": "Är lunchmail aktivt?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Är lunchmail aktivt?": {
+      "main": [
+        [
+          {
+            "node": "DB hämta öppna ärenden",
             "type": "main",
             "index": 0
           }
         ],
+        []
+      ]
+    },
+    "DB hämta öppna ärenden": {
+      "main": [
         [
           {
-            "node": "Skriv textlista (todo.txt)",
+            "node": "Formatera lunchmail",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Skicka lunchmail till mig själv": {
+    "Formatera lunchmail": {
       "main": [
         [
           {
-            "node": "Skriv textlista (todo.txt)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Skriv textlista (todo.txt)": {
-      "main": [
-        [
-          {
-            "node": "Skriv dashboarddata (JSON)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Läs utgående mail (Sent Items)": {
-      "main": [
-        [
-          {
-            "node": "Extrahera frågor i utgående mail",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Läs inkommande mail (INBOX / Office 365)": {
-      "main": [
-        [
-          {
-            "node": "Extrahera svar + frågor från kunder",
+            "node": "Outlook: skicka lunchmail",
             "type": "main",
             "index": 0
           }
@@ -333,10 +442,10 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "1",
+  "versionId": "2",
   "meta": {
     "templateCredsSetupCompleted": false,
-    "description": "Övervakar utgående frågor och inkommande svar, håller isär Fortnox-offerter, skriver textlista + dashboard-JSON och skickar daglig lunchrapport."
+    "description": "Outlook/Graph-baserad uppföljning med databaslagring av ärenden till/från dig samt Fortnox-offerter."
   },
-  "id": "mail_followup_dashboard"
+  "id": "office365_mail_cases_db"
 }
