@@ -1,0 +1,504 @@
+{
+  "name": "Office365 mailärenden -> DB + lunchrapport",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schema var 10:e minut",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        220,
+        260
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "typeVersion": 1.2
+    },
+    {
+      "id": "window",
+      "name": "Bygg tidsfönster",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        430,
+        260
+      ],
+      "parameters": {
+        "jsCode": "const state = getWorkflowStaticData('global');\nconst now = new Date();\n\n// Säker lookback: körning var 10:e minut men läs normalt 12 minuter bakåt (2 min buffert)\nconst requestedLookback = Number($env.LOOKBACK_MINUTES || 12);\nconst clampedLookback = Math.min(Math.max(requestedLookback, 5), 30); // aldrig längre än 30 min\n\nconst fallbackSince = new Date(now.getTime() - clampedLookback * 60 * 1000);\nlet since = state.lastPollAt ? new Date(state.lastPollAt) : fallbackSince;\n\n// Cap så att den inte kollar för långt bak vid stopp/omstart\nconst maxSince = new Date(now.getTime() - 30 * 60 * 1000);\nif (since < maxSince || Number.isNaN(since.getTime())) {\n  since = maxSince;\n}\n\nstate.lastPollAt = now.toISOString();\n\nreturn [{ json: {\n  since: since.toISOString(),\n  until: now.toISOString(),\n  lookbackMinutesUsed: Math.round((now.getTime() - since.getTime()) / 60000),\n  inboxFolderId: $env.OUTLOOK_INBOX_FOLDER_ID || 'inbox',\n  sentFolderId: $env.OUTLOOK_SENT_FOLDER_ID || 'sentitems'\n}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "outlook_sent",
+      "name": "Outlook: hämta skickade",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "position": [
+        660,
+        160
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "folderId": "={{$json.sentFolderId}}",
+          "filter": "=lastModifiedDateTime ge {{$json.since}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 2,
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
+        }
+      }
+    },
+    {
+      "id": "outlook_inbox",
+      "name": "Outlook: hämta inbox",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "position": [
+        660,
+        360
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "folderId": "={{$json.inboxFolderId}}",
+          "filter": "=lastModifiedDateTime ge {{$json.since}}"
+        },
+        "options": {}
+      },
+      "typeVersion": 2,
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
+        }
+      }
+    },
+    {
+      "id": "normalize_sent",
+      "name": "Normalisera skickade frågor",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        910,
+        160
+      ],
+      "parameters": {
+        "jsCode": "const rows = [];\n\nconst targetDomains = ($env.TARGET_DOMAINS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\nconst targetEmails = ($env.TARGET_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\n\nconst matchTarget = (emails) => {\n  const arr = (emails || []).map(e => (e || '').toLowerCase()).filter(Boolean);\n  if (!targetDomains.length && !targetEmails.length) return true; // fallback: ingen filterlista satt\n  return arr.some(email => {\n    const domain = email.split('@')[1] || '';\n    return targetEmails.includes(email) || targetDomains.includes(domain);\n  });\n};\n\nconst extractCompany = (email) => {\n  const domain = (email || '').split('@')[1] || '';\n  return domain.replace(/^www\\./i, '').toLowerCase();\n};\n\nconst extractOrderNumber = (text) => {\n  const m = (text || '').match(/\\b819\\d{3}\\b/);\n  return m ? m[0] : null;\n};\n\nconst extractQuoteNumber = (text) => {\n  const m = (text || '').match(/(?:offert(?:nummer)?|quote(?:\\s*no)?)[:#\\s-]*([A-Z0-9-]{4,})/i);\n  return m ? m[1] : null;\n};\n\nconst extractAmount = (text) => {\n  const m = (text || '').match(/(\\d{1,3}(?:[ .]\\d{3})*(?:,\\d{2})?)\\s*(kr|sek)/i);\n  return m ? `${m[1]} ${m[2].toUpperCase()}` : null;\n};\n\nconst extractQuestionText = (subject, body) => {\n  const source = `${subject || ''} ${body || ''}`.replace(/\\s+/g, ' ').trim();\n  const q = source.match(/([^?.!]{3,250}\\?)/);\n  return q ? q[1].trim() : source.slice(0, 300);\n};\n\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const bodyPreview = (m.bodyPreview || '').toString();\n  const body = ((m.bodyPreview || '') + ' ' + (m.body?.content || '')).toLowerCase();\n  const toList = (m.toRecipients || []).map(r => r?.emailAddress?.address).filter(Boolean);\n  const to = toList.join('; ');\n  const from = m.from?.emailAddress?.address || '';\n  const toName = (m.toRecipients || []).map(r => r?.emailAddress?.name).filter(Boolean).join('; ') || null;\n\n  // Förfilter före ev. AI/LLM: bara relevanta mottagardomäner/personer\n  if (!matchTarget(toList)) continue;\n\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|out of office|automatiskt svar)/i.test(subject + ' ' + from);\n  if (isAuto) continue;\n\n  const isFortnox = /(fortnox|offert|quote)/i.test(subject + ' ' + body);\n  const hasQuestion = /[?]|kan du|kan ni|återkoppla|behöver|när kan|vill du|vill ni/i.test(subject + ' ' + body);\n  if (!hasQuestion && !isFortnox) continue;\n\n  const orderNumber = extractOrderNumber(`${subject} ${bodyPreview}`);\n  const quoteNumber = extractQuoteNumber(`${subject} ${bodyPreview}`);\n  const quoteAmount = extractAmount(`${subject} ${bodyPreview}`);\n  const questionText = extractQuestionText(subject, bodyPreview);\n  const hasPdfAttachment = !!m.hasAttachments;\n\n  rows.push({json:{\n    external_message_id: m.id || '',\n    conversation_id: m.conversationId || '',\n    direction: 'outgoing',\n    case_type: isFortnox ? 'fortnox_offert' : 'question_out',\n    status: 'waiting_customer',\n    customer_email: to,\n    customer_company: extractCompany(toList[0] || ''),\n    customer_contact_person: toName,\n    owner_email: from,\n    waiting_for_email: toList[0] || to,\n    waiting_for_company: extractCompany(toList[0] || ''),\n    subject,\n    question_text: questionText,\n    question_excerpt: bodyPreview.slice(0,600),\n    order_number: orderNumber,\n    quote_number: quoteNumber,\n    quote_amount: quoteAmount,\n    quote_description: (bodyPreview || '').slice(0, 220),\n    mail_to: to,\n    pdf_expected: hasPdfAttachment,\n    pdf_parsed: false,\n    ai_candidate: true,\n    sent_at: m.sentDateTime || null,\n    received_at: null,\n    asked_at: m.sentDateTime || null,\n    answered_at: null,\n    source_system: 'office365_graph'\n  }});\n}\nreturn rows;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "normalize_inbox",
+      "name": "Normalisera inkommande",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        910,
+        360
+      ],
+      "parameters": {
+        "jsCode": "const rows = [];\n\nconst targetDomains = ($env.TARGET_DOMAINS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\nconst targetEmails = ($env.TARGET_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);\n\nconst matchTarget = (emails) => {\n  const arr = (emails || []).map(e => (e || '').toLowerCase()).filter(Boolean);\n  if (!targetDomains.length && !targetEmails.length) return true;\n  return arr.some(email => {\n    const domain = email.split('@')[1] || '';\n    return targetEmails.includes(email) || targetDomains.includes(domain);\n  });\n};\n\nconst extractCompany = (email) => {\n  const domain = (email || '').split('@')[1] || '';\n  return domain.replace(/^www\\./i, '').toLowerCase();\n};\n\nconst extractOrderNumber = (text) => {\n  const m = (text || '').match(/\\b819\\d{3}\\b/);\n  return m ? m[0] : null;\n};\n\nconst extractQuoteNumber = (text) => {\n  const m = (text || '').match(/(?:offert(?:nummer)?|quote(?:\\s*no)?)[:#\\s-]*([A-Z0-9-]{4,})/i);\n  return m ? m[1] : null;\n};\n\nconst extractAmount = (text) => {\n  const m = (text || '').match(/(\\d{1,3}(?:[ .]\\d{3})*(?:,\\d{2})?)\\s*(kr|sek)/i);\n  return m ? `${m[1]} ${m[2].toUpperCase()}` : null;\n};\n\nconst extractQuestionText = (subject, body) => {\n  const source = `${subject || ''} ${body || ''}`.replace(/\\s+/g, ' ').trim();\n  const q = source.match(/([^?.!]{3,250}\\?)/);\n  return q ? q[1].trim() : source.slice(0, 300);\n};\n\nfor (const item of items) {\n  const m = item.json;\n  const subject = (m.subject || '').trim();\n  const bodyPreview = (m.bodyPreview || '').toString();\n  const body = ((m.bodyPreview || '') + ' ' + (m.body?.content || '')).toLowerCase();\n  const from = m.from?.emailAddress?.address || '';\n  const fromName = m.from?.emailAddress?.name || null;\n\n  // Förfilter före ev. AI/LLM: bara relevanta avsändardomäner/personer\n  if (!matchTarget([from])) continue;\n\n  const isAuto = /(noreply|do-not-reply|mailer-daemon|out of office|automatiskt svar)/i.test(subject + ' ' + from);\n  if (isAuto) continue;\n\n  const hasQuestion = /[?]|kan du|kan ni|återkoppla|behöver|när kan|vill du|vill ni/i.test(subject + ' ' + body);\n  const isFortnox = /(fortnox|offert|quote)/i.test(subject + ' ' + body);\n\n  // Tidigt kandidatfilter: endast frågor, svar i pågående trådar eller offerter\n  const likelyReplyOrThread = /^(re|sv):/i.test(subject) || !!m.conversationId;\n  if (!hasQuestion && !isFortnox && !likelyReplyOrThread) continue;\n\n  const orderNumber = extractOrderNumber(`${subject} ${bodyPreview}`);\n  const quoteNumber = extractQuoteNumber(`${subject} ${bodyPreview}`);\n  const quoteAmount = extractAmount(`${subject} ${bodyPreview}`);\n  const questionText = extractQuestionText(subject, bodyPreview);\n\n  rows.push({json:{\n    external_message_id: m.id || '',\n    conversation_id: m.conversationId || '',\n    direction: 'incoming',\n    case_type: isFortnox ? 'fortnox_offert' : (hasQuestion ? 'question_in' : 'reply_in'),\n    status: hasQuestion ? 'waiting_me' : 'answered_customer',\n    customer_email: from,\n    customer_company: extractCompany(from),\n    customer_contact_person: fromName,\n    owner_email: '',\n    waiting_for_email: hasQuestion ? 'me' : null,\n    waiting_for_company: hasQuestion ? 'me' : null,\n    subject,\n    question_text: questionText,\n    question_excerpt: bodyPreview.slice(0,600),\n    order_number: orderNumber,\n    quote_number: quoteNumber,\n    quote_amount: quoteAmount,\n    quote_description: (bodyPreview || '').slice(0, 220),\n    mail_to: null,\n    pdf_expected: !!m.hasAttachments,\n    pdf_parsed: false,\n    ai_candidate: hasQuestion || likelyReplyOrThread || isFortnox,\n    sent_at: null,\n    received_at: m.receivedDateTime || null,\n    asked_at: m.receivedDateTime || null,\n    answered_at: null,\n    source_system: 'office365_graph'\n  }});\n}\nreturn rows;"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "merge",
+      "name": "Slå ihop ärenden",
+      "type": "n8n-nodes-base.merge",
+      "position": [
+        1140,
+        260
+      ],
+      "parameters": {
+        "mode": "append"
+      },
+      "typeVersion": 2.1
+    },
+    {
+      "id": "db_init",
+      "name": "DB init tabell",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1360,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE TABLE IF NOT EXISTS mail_cases (\n  id BIGSERIAL PRIMARY KEY,\n  external_message_id TEXT NOT NULL,\n  conversation_id TEXT,\n  direction TEXT NOT NULL,\n  case_type TEXT NOT NULL,\n  status TEXT NOT NULL,\n  customer_email TEXT,\n  customer_company TEXT,\n  customer_contact_person TEXT,\n  owner_email TEXT,\n  waiting_for_email TEXT,\n  waiting_for_company TEXT,\n  subject TEXT,\n  question_text TEXT,\n  question_excerpt TEXT,\n  order_number TEXT,\n  quote_number TEXT,\n  quote_amount TEXT,\n  quote_description TEXT,\n  mail_to TEXT,\n  pdf_expected BOOLEAN DEFAULT FALSE,\n  pdf_parsed BOOLEAN DEFAULT FALSE,\n  ai_candidate BOOLEAN DEFAULT FALSE,\n  sent_at TIMESTAMPTZ,\n  received_at TIMESTAMPTZ,\n  asked_at TIMESTAMPTZ,\n  answered_at TIMESTAMPTZ,\n  source_system TEXT DEFAULT 'office365_graph',\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  updated_at TIMESTAMPTZ DEFAULT NOW(),\n  UNIQUE (external_message_id)\n);\n\nCREATE TABLE IF NOT EXISTS quotes (\n  id BIGSERIAL PRIMARY KEY,\n  quote_number TEXT,\n  external_message_id TEXT NOT NULL,\n  conversation_id TEXT,\n  customer_name TEXT,\n  customer_company TEXT,\n  contact_person TEXT,\n  mail_to TEXT,\n  quote_amount TEXT,\n  quote_description TEXT,\n  order_number TEXT,\n  sent_at TIMESTAMPTZ,\n  received_at TIMESTAMPTZ,\n  pdf_expected BOOLEAN DEFAULT FALSE,\n  pdf_parsed BOOLEAN DEFAULT FALSE,\n  ai_candidate BOOLEAN DEFAULT FALSE,\n  pdf_text_excerpt TEXT,\n  source_system TEXT DEFAULT 'office365_graph',\n  created_at TIMESTAMPTZ DEFAULT NOW(),\n  updated_at TIMESTAMPTZ DEFAULT NOW(),\n  UNIQUE (external_message_id)\n);"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "db_upsert",
+      "name": "DB upsert mail_cases",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1360,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO mail_cases (\n  external_message_id, conversation_id, direction, case_type, status,\n  customer_email, customer_company, customer_contact_person, owner_email, waiting_for_email, waiting_for_company,\n  subject, question_text, question_excerpt, order_number, quote_number, quote_amount, quote_description, mail_to,\n  pdf_expected, pdf_parsed, ai_candidate,\n  sent_at, received_at, asked_at, answered_at, source_system, updated_at\n) VALUES (\n  {{ $json.external_message_id ? \"'\" + $json.external_message_id.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.conversation_id ? \"'\" + $json.conversation_id.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.direction ? \"'\" + $json.direction + \"'\" : 'NULL' }},\n  {{ $json.case_type ? \"'\" + $json.case_type + \"'\" : 'NULL' }},\n  {{ $json.status ? \"'\" + $json.status + \"'\" : 'NULL' }},\n  {{ $json.customer_email ? \"'\" + $json.customer_email.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.customer_company ? \"'\" + $json.customer_company.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.customer_contact_person ? \"'\" + $json.customer_contact_person.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.owner_email ? \"'\" + $json.owner_email.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.waiting_for_email ? \"'\" + $json.waiting_for_email.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.waiting_for_company ? \"'\" + $json.waiting_for_company.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.subject ? \"'\" + $json.subject.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.question_text ? \"'\" + $json.question_text.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.question_excerpt ? \"'\" + $json.question_excerpt.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.order_number ? \"'\" + $json.order_number + \"'\" : 'NULL' }},\n  {{ $json.quote_number ? \"'\" + $json.quote_number.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.quote_amount ? \"'\" + $json.quote_amount.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.quote_description ? \"'\" + $json.quote_description.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.mail_to ? \"'\" + $json.mail_to.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n  {{ $json.pdf_expected ? 'TRUE' : 'FALSE' }},\n  {{ $json.pdf_parsed ? 'TRUE' : 'FALSE' }},\n  {{ $json.ai_candidate ? 'TRUE' : 'FALSE' }},\n  {{ $json.sent_at ? \"'\" + $json.sent_at + \"'\" : 'NULL' }},\n  {{ $json.received_at ? \"'\" + $json.received_at + \"'\" : 'NULL' }},\n  {{ $json.asked_at ? \"'\" + $json.asked_at + \"'\" : 'NULL' }},\n  {{ $json.answered_at ? \"'\" + $json.answered_at + \"'\" : 'NULL' }},\n  'office365_graph',\n  NOW()\n)\nON CONFLICT (external_message_id) DO UPDATE SET\n  conversation_id = EXCLUDED.conversation_id,\n  direction = EXCLUDED.direction,\n  case_type = EXCLUDED.case_type,\n  status = EXCLUDED.status,\n  customer_email = EXCLUDED.customer_email,\n  customer_company = EXCLUDED.customer_company,\n  customer_contact_person = EXCLUDED.customer_contact_person,\n  owner_email = EXCLUDED.owner_email,\n  waiting_for_email = EXCLUDED.waiting_for_email,\n  waiting_for_company = EXCLUDED.waiting_for_company,\n  subject = EXCLUDED.subject,\n  question_text = EXCLUDED.question_text,\n  question_excerpt = EXCLUDED.question_excerpt,\n  order_number = COALESCE(EXCLUDED.order_number, mail_cases.order_number),\n  quote_number = COALESCE(EXCLUDED.quote_number, mail_cases.quote_number),\n  quote_amount = COALESCE(EXCLUDED.quote_amount, mail_cases.quote_amount),\n  quote_description = COALESCE(EXCLUDED.quote_description, mail_cases.quote_description),\n  mail_to = COALESCE(EXCLUDED.mail_to, mail_cases.mail_to),\n  pdf_expected = EXCLUDED.pdf_expected,\n  pdf_parsed = EXCLUDED.pdf_parsed,\n  ai_candidate = EXCLUDED.ai_candidate,\n  sent_at = COALESCE(EXCLUDED.sent_at, mail_cases.sent_at),\n  received_at = COALESCE(EXCLUDED.received_at, mail_cases.received_at),\n  asked_at = COALESCE(EXCLUDED.asked_at, mail_cases.asked_at),\n  answered_at = COALESCE(EXCLUDED.answered_at, mail_cases.answered_at),\n  updated_at = NOW();"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "db_reconcile",
+      "name": "DB reconcila svar",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1590,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE mail_cases outq\nSET status='answered_customer', answered_at = NOW(), updated_at = NOW()\nFROM mail_cases inb\nWHERE outq.conversation_id IS NOT NULL\n  AND outq.conversation_id = inb.conversation_id\n  AND outq.direction='outgoing'\n  AND outq.status='waiting_customer'\n  AND inb.direction='incoming';"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "lunch_guard",
+      "name": "Lunchguard",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1810,
+        340
+      ],
+      "parameters": {
+        "jsCode": "const state = getWorkflowStaticData('global');\nstate.lastLunchSummaryDate = state.lastLunchSummaryDate || '';\nconst now = new Date();\nconst today = now.toISOString().slice(0,10);\nconst should = now.getHours() === 12 && state.lastLunchSummaryDate !== today;\nif (should) state.lastLunchSummaryDate = today;\nreturn [{json:{shouldSendLunch: should}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "if_lunch",
+      "name": "Är lunchmail aktivt?",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2020,
+        340
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.shouldSendLunch}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "db_lunch_select",
+      "name": "DB hämta öppna ärenden",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2240,
+        260
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT customer_email, customer_company, waiting_for_email, waiting_for_company, subject, case_type, status,\nCOALESCE(asked_at, sent_at, received_at) AS event_time, order_number\nFROM mail_cases\nWHERE status IN ('waiting_customer','waiting_me')\nORDER BY event_time DESC\nLIMIT 100;"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "format_lunch",
+      "name": "Formatera lunchmail",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2460,
+        260
+      ],
+      "parameters": {
+        "jsCode": "const rows = items.map(i => i.json);\nconst waitingCustomer = rows.filter(r => r.status === 'waiting_customer');\nconst waitingMe = rows.filter(r => r.status === 'waiting_me');\nconst lines = [];\nlines.push(`Lunchrapport ${new Date().toISOString().slice(0,10)}`);\nlines.push('');\nlines.push('Jag väntar på svar från kund:');\nif (!waitingCustomer.length) lines.push('- Inga öppna ärenden.');\nfor (const r of waitingCustomer) {\n  lines.push(`- ${r.waiting_for_email || r.customer_email || '(okänd)'} (${r.waiting_for_company || r.customer_company || 'okänt bolag'}) | ${r.subject || '(utan ämne)'} | order: ${r.order_number || '-'} | typ: ${r.case_type}`);\n}\nlines.push('');\nlines.push('Kunder väntar på svar från mig:');\nif (!waitingMe.length) lines.push('- Inga öppna ärenden.');\nfor (const r of waitingMe) {\n  lines.push(`- ${r.customer_email || '(okänd)'} (${r.customer_company || 'okänt bolag'}) | ${r.subject || '(utan ämne)'} | order: ${r.order_number || '-'} | typ: ${r.case_type}`);\n}\nreturn [{json:{body: lines.join('\\n')}}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "send_lunch",
+      "name": "Outlook: skicka lunchmail",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "position": [
+        2680,
+        260
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "subject": "Lunchrapport – mailärenden",
+        "message": "={{$json.body}}",
+        "toRecipients": "={{$env.OWNER_EMAIL}}",
+        "additionalFields": {}
+      },
+      "typeVersion": 2,
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "__SET_OUTLOOK_CREDENTIAL__",
+          "name": "Office365 Outlook"
+        }
+      }
+    },
+    {
+      "id": "db_upsert_quotes",
+      "name": "DB upsert quotes",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1590,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO quotes (\n  quote_number, external_message_id, conversation_id,\n  customer_name, customer_company, contact_person, mail_to,\n  quote_amount, quote_description, order_number,\n  sent_at, received_at, pdf_expected, pdf_parsed, ai_candidate, pdf_text_excerpt, source_system, updated_at\n)\nSELECT\n  COALESCE(NULLIF(quote_number,''), 'UNKNOWN-' || external_message_id),\n  external_message_id,\n  conversation_id,\n  customer_email,\n  customer_company,\n  customer_contact_person,\n  COALESCE(mail_to, customer_email),\n  quote_amount,\n  quote_description,\n  order_number,\n  sent_at,\n  received_at,\n  pdf_expected,\n  pdf_parsed,\n  ai_candidate,\n  question_excerpt,\n  source_system,\n  NOW()\nFROM mail_cases\nWHERE case_type = 'fortnox_offert'\n  AND external_message_id = {{ $json.external_message_id ? \"'\" + $json.external_message_id.replaceAll(\"'\", \"''\") + \"'\" : \"''\" }}\nON CONFLICT (external_message_id) DO UPDATE SET\n  quote_number = COALESCE(EXCLUDED.quote_number, quotes.quote_number),\n  customer_name = COALESCE(EXCLUDED.customer_name, quotes.customer_name),\n  customer_company = COALESCE(EXCLUDED.customer_company, quotes.customer_company),\n  contact_person = COALESCE(EXCLUDED.contact_person, quotes.contact_person),\n  mail_to = COALESCE(EXCLUDED.mail_to, quotes.mail_to),\n  quote_amount = COALESCE(EXCLUDED.quote_amount, quotes.quote_amount),\n  quote_description = COALESCE(EXCLUDED.quote_description, quotes.quote_description),\n  order_number = COALESCE(EXCLUDED.order_number, quotes.order_number),\n  sent_at = COALESCE(EXCLUDED.sent_at, quotes.sent_at),\n  received_at = COALESCE(EXCLUDED.received_at, quotes.received_at),\n  pdf_expected = EXCLUDED.pdf_expected,\n  pdf_parsed = EXCLUDED.pdf_parsed,\n  ai_candidate = EXCLUDED.ai_candidate,\n  pdf_text_excerpt = COALESCE(EXCLUDED.pdf_text_excerpt, quotes.pdf_text_excerpt),\n  updated_at = NOW();"
+      },
+      "typeVersion": 2.4,
+      "credentials": {
+        "postgres": {
+          "id": "__SET_POSTGRES_CREDENTIAL__",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "id": "no_lunch_skip",
+      "name": "Ingen lunchmail (skip)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schema var 10:e minut": {
+      "main": [
+        [
+          {
+            "node": "Bygg tidsfönster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bygg tidsfönster": {
+      "main": [
+        [
+          {
+            "node": "Outlook: hämta skickade",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Outlook: hämta inbox",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outlook: hämta skickade": {
+      "main": [
+        [
+          {
+            "node": "Normalisera skickade frågor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outlook: hämta inbox": {
+      "main": [
+        [
+          {
+            "node": "Normalisera inkommande",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisera skickade frågor": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop ärenden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisera inkommande": {
+      "main": [
+        [
+          {
+            "node": "Slå ihop ärenden",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Slå ihop ärenden": {
+      "main": [
+        [
+          {
+            "node": "DB init tabell",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB init tabell": {
+      "main": [
+        [
+          {
+            "node": "DB upsert mail_cases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB upsert mail_cases": {
+      "main": [
+        [
+          {
+            "node": "DB upsert quotes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB reconcila svar": {
+      "main": [
+        [
+          {
+            "node": "Lunchguard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lunchguard": {
+      "main": [
+        [
+          {
+            "node": "Är lunchmail aktivt?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Är lunchmail aktivt?": {
+      "main": [
+        [
+          {
+            "node": "DB hämta öppna ärenden",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ingen lunchmail (skip)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB hämta öppna ärenden": {
+      "main": [
+        [
+          {
+            "node": "Formatera lunchmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatera lunchmail": {
+      "main": [
+        [
+          {
+            "node": "Outlook: skicka lunchmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB upsert quotes": {
+      "main": [
+        [
+          {
+            "node": "DB reconcila svar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingen lunchmail (skip)": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "2",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "Outlook/Graph mailuppföljning med databaslagring av ärenden och separat offertentitet (quotes), inkl. metadata för kund, kontakt, mottagare, offertnr och pdf-status."
+  },
+  "id": "office365_mail_cases_db"
+}
