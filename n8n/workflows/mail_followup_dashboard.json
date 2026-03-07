@@ -294,6 +294,17 @@
           "name": "Postgres"
         }
       }
+    },
+    {
+      "id": "no_lunch_skip",
+      "name": "Ingen lunchmail (skip)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {}
     }
   ],
   "connections": {
@@ -432,7 +443,13 @@
             "index": 0
           }
         ],
-        []
+        [
+          {
+            "node": "Ingen lunchmail (skip)",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "DB hämta öppna ärenden": {
@@ -466,6 +483,11 @@
             "index": 0
           }
         ]
+      ]
+    },
+    "Ingen lunchmail (skip)": {
+      "main": [
+        []
       ]
     }
   },

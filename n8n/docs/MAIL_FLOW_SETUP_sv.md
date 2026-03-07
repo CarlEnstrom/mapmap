@@ -66,6 +66,9 @@ Detta minskar token-spill och fokuserar på mail där det faktiskt kan finnas sv
 - `TARGET_DOMAINS` (kommaseparerat, t.ex. `kund.se,partner.com`)
 - `TARGET_EMAILS` (kommaseparerat, t.ex. `anna@kund.se,info@partner.com`)
 
+
+- IF-noden **"Är lunchmail aktivt?"** har nu både true/false-gren kopplad. False går till en no-op ("Ingen lunchmail (skip)") så flödet inte ser tomt ut i editorn.
+
 ## Import
 1. Workflows → Import from file
 2. Välj `n8n/workflows/mail_followup_dashboard.json`
